@@ -1,0 +1,20 @@
+# Build artifacts and host-only files that shouldn't ship in the image.
+.git
+.gitignore
+build*/
+out/
+bin/
+obj/
+*.exe
+*.obj
+*.pdb
+*.ilk
+docs/
+scripts/
+tests/
+README.md
+Dockerfile
+.dockerignore
+infra/
+*.bicep
+.azure/

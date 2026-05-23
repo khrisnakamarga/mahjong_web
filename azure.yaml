@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+#
+# Azure Developer CLI (azd) manifest for the C++ Hong Kong Mahjong web server.
+#
+# Mirrors the structure of the sibling TypeScript project so `azd up` provisions
+# the same shape of resources: ACR + Container Apps + managed identity, with
+# Log Analytics and Application Insights for observability. The C++ server is
+# packaged as a Linux container via the multi-stage Dockerfile at the repo root.
+#
+# Local commands (do NOT run unless you actually want to deploy):
+#   azd auth login
+#   azd env new mahjong-dev
+#   azd up                                  # provisions infra + builds image + deploys
+#   azd deploy                              # incremental: rebuild + redeploy container only
+#   azd down --purge                        # tear everything down
+name: hongkong-mahjong-cpp
+metadata:
+  template: azd-init
+
+infra:
+  provider: bicep
+  path: infra
+
+services:
+  web:
+    project: .
+    # `language: js` is a no-op here — when the `docker:` block is set, AZD
+    # builds the image straight from the Dockerfile and never invokes any
+    # JavaScript tooling. We pin it to `js` to match the sibling TypeScript
+    # project's manifest exactly, since older azd CLI versions don't accept
+    # `docker` as a language value.
+    language: js
+    host: containerapp
+    docker:
+      path: Dockerfile
+      context: .

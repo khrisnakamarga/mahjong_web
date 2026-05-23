@@ -1,0 +1,340 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "18314775714031527217"
+    }
+  },
+  "parameters": {
+    "environmentName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "metadata": {
+        "description": "Name of the AZD environment. Provided automatically as AZURE_ENV_NAME."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "westus3",
+      "minLength": 1,
+      "metadata": {
+        "description": "Azure region for all resources."
+      }
+    },
+    "appName": {
+      "type": "string",
+      "defaultValue": "mahjong-cpp",
+      "minLength": 1,
+      "maxLength": 40,
+      "metadata": {
+        "description": "Short application name; used as a prefix in resource names."
+      }
+    },
+    "environmentType": {
+      "type": "string",
+      "defaultValue": "prod",
+      "allowedValues": [
+        "dev",
+        "test",
+        "prod"
+      ],
+      "metadata": {
+        "description": "Environment classification, used as a tag and to nudge SKU sizing."
+      }
+    },
+    "containerImageName": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest",
+      "metadata": {
+        "description": "Container image to deploy. AZD overrides this once it has built and pushed the real image. The default is a public placeholder that lets the first `azd up` complete cleanly."
+      }
+    },
+    "minReplicas": {
+      "type": "int",
+      "defaultValue": 1,
+      "minValue": 1,
+      "maxValue": 10,
+      "metadata": {
+        "description": "Minimum replicas. Keep at 1 because room state is in-memory."
+      }
+    },
+    "maxReplicas": {
+      "type": "int",
+      "defaultValue": 1,
+      "minValue": 1,
+      "maxValue": 10,
+      "metadata": {
+        "description": "Maximum replicas. Capped low for the same in-memory reason."
+      }
+    },
+    "containerCpu": {
+      "type": "string",
+      "defaultValue": "0.5",
+      "metadata": {
+        "description": "Container CPU. Bicep \"json()\" wrapper because Container Apps wants a number not a string."
+      }
+    },
+    "containerMemory": {
+      "type": "string",
+      "defaultValue": "1Gi",
+      "metadata": {
+        "description": "Container memory."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Optional tag map merged into every resource."
+      }
+    }
+  },
+  "variables": {
+    "resourceToken": "[uniqueString(subscription().id, parameters('environmentName'), parameters('location'))]",
+    "safeEnvironmentName": "[toLower(replace(parameters('environmentName'), '_', '-'))]",
+    "safeAppName": "[toLower(replace(parameters('appName'), '_', '-'))]",
+    "alphanumericAppName": "[replace(variables('safeAppName'), '-', '')]",
+    "alphanumericEnvironmentName": "[replace(variables('safeEnvironmentName'), '-', '')]",
+    "baseTags": "[union(parameters('tags'), createObject('application', parameters('appName'), 'environment', parameters('environmentName'), 'environmentType', parameters('environmentType'), 'azd-env-name', parameters('environmentName')))]",
+    "managedIdentityName": "[take(format('id-{0}-{1}', variables('safeAppName'), variables('safeEnvironmentName')), 128)]",
+    "logAnalyticsName": "[take(format('log-{0}-{1}-{2}', variables('safeAppName'), variables('safeEnvironmentName'), variables('resourceToken')), 63)]",
+    "appInsightsName": "[take(format('appi-{0}-{1}-{2}', variables('safeAppName'), variables('safeEnvironmentName'), variables('resourceToken')), 255)]",
+    "containerEnvironmentName": "[take(format('cae-{0}-{1}-{2}', variables('safeAppName'), variables('safeEnvironmentName'), variables('resourceToken')), 60)]",
+    "containerAppName": "[take(format('ca-{0}-{1}', variables('safeAppName'), variables('safeEnvironmentName')), 32)]",
+    "acrName": "[take(format('{0}{1}{2}', variables('alphanumericAppName'), variables('alphanumericEnvironmentName'), variables('resourceToken')), 50)]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[variables('managedIdentityName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('baseTags')]"
+    },
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('logAnalyticsName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('baseTags')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30,
+        "publicNetworkAccessForIngestion": "Enabled",
+        "publicNetworkAccessForQuery": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Insights/components",
+      "apiVersion": "2020-02-02",
+      "name": "[variables('appInsightsName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('baseTags')]",
+      "kind": "web",
+      "properties": {
+        "Application_Type": "web",
+        "WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ContainerRegistry/registries",
+      "apiVersion": "2023-07-01",
+      "name": "[variables('acrName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('baseTags')]",
+      "sku": {
+        "name": "Basic"
+      },
+      "properties": {
+        "adminUserEnabled": false
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), 'acrpull')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')]",
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('containerEnvironmentName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('baseTags')]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2022-10-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2022-10-01').primarySharedKey]"
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('containerAppName')]",
+      "location": "[parameters('location')]",
+      "tags": "[union(variables('baseTags'), createObject('azd-service-name', 'web'))]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')))]": {}
+        }
+      },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvironmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "registries": [
+            {
+              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-07-01').loginServer]",
+              "identity": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]"
+            }
+          ],
+          "ingress": {
+            "external": true,
+            "targetPort": 8080,
+            "transport": "auto",
+            "allowInsecure": false,
+            "traffic": [
+              {
+                "weight": 100,
+                "latestRevision": true
+              }
+            ]
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "web",
+              "image": "[parameters('containerImageName')]",
+              "env": [
+                {
+                  "name": "PORT",
+                  "value": "8080"
+                },
+                {
+                  "name": "MAHJONG_WEB_DIR",
+                  "value": "/app/web"
+                },
+                {
+                  "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                  "value": "[reference(resourceId('Microsoft.Insights/components', variables('appInsightsName')), '2020-02-02').ConnectionString]"
+                },
+                {
+                  "name": "AZURE_CLIENT_ID",
+                  "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').clientId]"
+                }
+              ],
+              "resources": {
+                "cpu": "[json(parameters('containerCpu'))]",
+                "memory": "[parameters('containerMemory')]"
+              },
+              "probes": [
+                {
+                  "type": "Liveness",
+                  "httpGet": {
+                    "path": "/api/health",
+                    "port": 8080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 30
+                },
+                {
+                  "type": "Readiness",
+                  "httpGet": {
+                    "path": "/api/health",
+                    "port": 8080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 10
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": "[parameters('minReplicas')]",
+            "maxReplicas": "[parameters('maxReplicas')]",
+            "rules": [
+              {
+                "name": "http-concurrency",
+                "http": {
+                  "metadata": {
+                    "concurrentRequests": "100"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), 'acrpull'))]",
+        "[resourceId('Microsoft.Insights/components', variables('appInsightsName'))]",
+        "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvironmentName'))]",
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-07-01').loginServer]"
+    },
+    "AZURE_CONTAINER_REGISTRY_NAME": {
+      "type": "string",
+      "value": "[variables('acrName')]"
+    },
+    "AZURE_CONTAINER_APP_NAME": {
+      "type": "string",
+      "value": "[variables('containerAppName')]"
+    },
+    "AZURE_CONTAINER_APP_ENVIRONMENT_NAME": {
+      "type": "string",
+      "value": "[variables('containerEnvironmentName')]"
+    },
+    "AZURE_RESOURCE_GROUP": {
+      "type": "string",
+      "value": "[resourceGroup().name]"
+    },
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Insights/components', variables('appInsightsName')), '2020-02-02').ConnectionString]"
+    },
+    "SERVICE_WEB_URI": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+    },
+    "SERVICE_WEB_NAME": {
+      "type": "string",
+      "value": "[variables('containerAppName')]"
+    }
+  }
+}

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d4d2f" />
+  <title>Hong Kong Mahjong</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main id="app">
+    <section id="lobby" class="panel">
+      <h1>Hong Kong Mahjong</h1>
+      <p class="tagline">Authoritative C++ engine · WebSocket multiplayer</p>
+
+      <div class="card">
+        <h2>Create a room</h2>
+        <p>Start a new game. Then click a seat to take it yourself, or copy a seat link to invite a friend.</p>
+        <button id="createRoomBtn" class="primary">Create new room</button>
+        <div id="createRoomResult" class="hidden">
+          <p>Room code: <strong id="newRoomCode"></strong></p>
+          <label>Your name <input id="createDisplayName" type="text" maxlength="32" placeholder="Player" autocomplete="off" /></label>
+          <div id="seatGrid" class="seatGrid" aria-label="Seats in the room you created"></div>
+          <p class="hint">Status auto-refreshes as players join.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Join a room</h2>
+        <label>Room code <input id="joinRoomCode" type="text" maxlength="6" placeholder="ABCDEF" autocomplete="off" /></label>
+        <label>Display name <input id="joinDisplayName" type="text" maxlength="32" placeholder="Your name" autocomplete="off" /></label>
+        <div id="joinSeatGrid" class="seatGrid hidden" aria-label="Seats in the room you're joining"></div>
+        <p id="joinSeatHint" class="hint hidden"></p>
+        <details id="joinAdvanced" class="advanced">
+          <summary>Manual seat / token (advanced)</summary>
+          <label>Seat index <input id="joinSeatIndex" type="number" min="0" max="3" value="0" /></label>
+          <label>Seat token <input id="joinSeatToken" type="text" placeholder="from your private link" autocomplete="off" /></label>
+          <button id="joinRoomBtn" class="primary">Join with token</button>
+        </details>
+        <button id="spectateBtn" class="secondary">Spectate only</button>
+      </div>
+    </section>
+
+    <section id="table" class="hidden">
+      <header class="topbar">
+        <div class="status" id="statusText">Connecting…</div>
+        <div class="controls">
+          <label class="toggle" title="Automatically pass on pass-only windows where you have no claim option. Any Chow / Pong / Kong / Mahjong opportunity for you interrupts auto-pass so you can decide."><input type="checkbox" id="autoAiToggle" /> Auto pass</label>
+          <label class="toggle" title="Chicken Hand: set the minimum fan threshold to 0 so any winning hand qualifies for payment. Off restores the standard 3-fan minimum."><input type="checkbox" id="chickenHandToggle" /> Chicken Hand</label>
+          <label class="slider" title="How long the AI thinks between moves. 0 = instant.">AI speed:
+            <input type="range" id="aiSpeedSlider" min="0" max="5000" step="100" value="0" />
+            <span id="aiSpeedValue">0.0s</span>
+          </label>
+          <button id="toggleHistoryBtn" class="secondary" type="button" aria-pressed="false">History</button>
+          <button id="leaveBtn" class="secondary" type="button">Leave</button>
+        </div>
+      </header>
+
+      <div class="tableArea">
+        <div class="board">
+          <canvas id="boardCanvas" width="1280" height="900"></canvas>
+        </div>
+        <aside class="actionPanel">
+          <h3>Legal actions</h3>
+          <div id="actionButtons"></div>
+          <div id="conclusion" class="hidden"></div>
+          <div id="winHistory" class="hidden"></div>
+        </aside>
+      </div>
+    </section>
+
+    <div id="rotateOverlay" role="dialog" aria-label="Rotate device hint">
+      <div class="rotateInner">
+        <div class="rotateIcon">↻</div>
+        <h2>Rotate your device</h2>
+        <p>Mahjong tables are square. For the best experience on phone, please switch to landscape.</p>
+        <button id="dismissRotateBtn" class="secondary" type="button">Continue in portrait</button>
+      </div>
+    </div>
+  </main>
+
+  <script src="tiles.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
