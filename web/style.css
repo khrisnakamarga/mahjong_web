@@ -466,6 +466,126 @@ details.advanced[open] summary { margin-bottom: 6px; opacity: 1; }
   #rotateOverlay:not(.dismissed) { display: flex; }
 }
 
+/* ---------- Invite modal ---------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.78);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  padding: 18px;
+}
+.modal.hidden { display: none; }
+.modal .modalInner {
+  background: #14322a;
+  color: var(--cream);
+  border: 1px solid var(--gold);
+  border-radius: 14px;
+  padding: 22px 22px 18px;
+  max-width: 560px;
+  width: 100%;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.modal .modalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.modal .modalHeader h2 {
+  color: var(--gold);
+  margin: 0;
+  font-size: 22px;
+}
+.modal .modalHeader button {
+  background: transparent;
+  color: var(--cream);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 50%;
+  width: 36px;
+  height: 36px;
+  font-size: 22px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+}
+.modal .modalSubtitle {
+  margin: 0 0 14px;
+  font-size: 14px;
+  opacity: 0.88;
+}
+.modal .modalSubtitle strong { color: var(--gold); letter-spacing: 1px; }
+#inviteList {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.inviteRow {
+  display: grid;
+  grid-template-columns: 90px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.inviteRow .inviteLabel {
+  font-weight: 700;
+  color: var(--gold);
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.inviteRow .inviteUrl {
+  background: rgba(0, 0, 0, 0.4);
+  color: var(--cream);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: ui-monospace, "Consolas", "Menlo", monospace;
+  font-size: 12px;
+  width: 100%;
+  user-select: all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inviteRow .inviteCopy {
+  min-height: var(--tap);
+  padding: 8px 14px;
+  margin: 0;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.inviteRow.noToken {
+  opacity: 0.55;
+}
+.inviteRow.noToken .inviteUrl {
+  color: rgba(255, 255, 255, 0.55);
+  font-style: italic;
+  font-family: inherit;
+}
+.inviteActions {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.inviteActions button { flex: 1 1 auto; min-height: var(--tap); }
+
+@media (max-width: 540px) {
+  .inviteRow {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+  .inviteRow .inviteCopy { width: 100%; }
+}
+
 /* Lobby on phone: tighter padding, full-width buttons. */
 @media (max-width: 600px) {
   #lobby { padding: 16px 12px calc(16px + env(safe-area-inset-bottom, 0px)); }

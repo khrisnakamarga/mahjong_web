@@ -92,6 +92,159 @@ function startLobbyPolling(code) {
   state.lobbyPollTimer = setInterval(tick, 3000);
 }
 
+// ---------- Invite-link helpers (shared by lobby seat cards and the
+// in-room Invite modal). Always build URLs from window.location.origin so
+// they work both locally and on the deployed Container App, regardless of
+// whether MAHJONG_PUBLIC_BASE_URL was configured on the server.
+function buildSeatUrl(roomCode, seatIndex, token) {
+  return `${location.origin}/?room=${roomCode}&seat=${seatIndex}&token=${token}`;
+}
+function buildSpectatorUrl(roomCode) {
+  return `${location.origin}/?room=${roomCode}`;
+}
+function copyToClipboard(text, button, restoreLabel) {
+  const restore = restoreLabel != null ? restoreLabel
+    : (button ? button.textContent : null);
+  const succeed = () => {
+    if (button) {
+      button.textContent = 'Copied!';
+      setTimeout(() => { if (restore != null) button.textContent = restore; }, 1500);
+    }
+  };
+  const fallback = () => {
+    // Older browsers / insecure contexts: prompt as a last resort so the
+    // user can manually copy the text.
+    try { window.prompt('Copy this link manually:', text); }
+    catch (_) { alert('Clipboard failed -- URL:\n' + text); }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(succeed, fallback);
+  } else {
+    fallback();
+  }
+}
+
+// ---------- In-room Invite modal ----------
+function openInviteModal() {
+  const modal = $('inviteModal');
+  if (!modal) return;
+  renderInviteList();
+  modal.classList.remove('hidden');
+}
+function closeInviteModal() {
+  const modal = $('inviteModal');
+  if (modal) modal.classList.add('hidden');
+}
+function inviteSeatEntries() {
+  // Resolve the room code from in-room state (state.roomCode) first, falling
+  // back to lobby state. Always derive URLs from window.location.origin.
+  const code = state.roomCode || state.lobbyRoomCode;
+  const seats = state.snapshot && state.snapshot.seats ? state.snapshot.seats : [];
+  const entries = [];
+  for (let i = 0; i < 4; i++) {
+    const wind = SEAT_LABELS[i] || `Seat ${i}`;
+    const token = state.lobbyTokens && state.lobbyTokens[i];
+    const seat = seats[i] || null;
+    const taken = seat && seat.controller === 'human';
+    const occupant = seat && seat.displayName ? seat.displayName : null;
+    entries.push({
+      seatIndex: i,
+      label: wind,
+      url: token && code ? buildSeatUrl(code, i, token) : null,
+      hasToken: !!token,
+      taken,
+      occupant,
+    });
+  }
+  return entries;
+}
+function renderInviteList() {
+  const code = state.roomCode || state.lobbyRoomCode || '';
+  $('inviteRoomCode').textContent = code;
+  const list = $('inviteList');
+  if (!list) return;
+  list.innerHTML = '';
+
+  // ---- Spectator link (always available; no token needed).
+  if (code) {
+    const specUrl = buildSpectatorUrl(code);
+    list.appendChild(renderInviteRow({
+      label: 'Spectator',
+      url: specUrl,
+      hasToken: true,
+      hint: 'Watch only -- share with anyone.',
+    }));
+  }
+
+  // ---- Per-seat links.
+  for (const e of inviteSeatEntries()) {
+    let hint;
+    if (e.taken && e.occupant) hint = `Taken by ${e.occupant}`;
+    else if (e.taken) hint = 'Taken';
+    list.appendChild(renderInviteRow({
+      label: e.label,
+      url: e.url,
+      hasToken: e.hasToken,
+      hint,
+    }));
+  }
+}
+function renderInviteRow(opts) {
+  const row = document.createElement('div');
+  row.className = 'inviteRow' + (opts.hasToken ? '' : ' noToken');
+  const label = document.createElement('div');
+  label.className = 'inviteLabel';
+  label.textContent = opts.label;
+  const url = document.createElement('input');
+  url.className = 'inviteUrl';
+  url.type = 'text';
+  url.readOnly = true;
+  if (opts.hasToken && opts.url) {
+    url.value = opts.url;
+    url.title = opts.url;
+  } else {
+    url.value = "(no invite link -- you don't have this seat's token)";
+  }
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'inviteCopy secondary';
+  btn.textContent = 'Copy';
+  if (!opts.hasToken || !opts.url) {
+    btn.disabled = true;
+  } else {
+    btn.addEventListener('click', () => {
+      // Select the input as visual feedback.
+      url.focus(); url.select();
+      copyToClipboard(opts.url, btn, 'Copy');
+    });
+  }
+  row.append(label, url, btn);
+  if (opts.hint) {
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.style.gridColumn = '1 / -1';
+    hint.style.fontSize = '12px';
+    hint.style.margin = '0';
+    hint.textContent = opts.hint;
+    row.appendChild(hint);
+  }
+  return row;
+}
+function buildAllInvitesText() {
+  const code = state.roomCode || state.lobbyRoomCode || '';
+  const lines = [`Hong Kong Mahjong -- Room ${code}`, ''];
+  if (code) lines.push(`Spectator: ${buildSpectatorUrl(code)}`);
+  for (const e of inviteSeatEntries()) {
+    if (e.hasToken && e.url) {
+      const suffix = e.taken && e.occupant ? `  (currently: ${e.occupant})` : '';
+      lines.push(`${e.label.padEnd(8, ' ')}: ${e.url}${suffix}`);
+    } else {
+      lines.push(`${e.label.padEnd(8, ' ')}: (no invite link)`);
+    }
+  }
+  return lines.join('\n');
+}
+
 // Render one seat card -- shared between the "Create" and "Join" grids.
 // `opts.ownTokens` is a map seatIndex->token of tokens the local user owns;
 // seats in this map render a primary "Join as <wind>" button. `opts.context`
@@ -155,12 +308,11 @@ function renderSeatCard(seatIndex, snapshot, opts) {
   }
 
   // Copy-link button (Create flow only) so the host can DM the seat URL to a
-  // friend. The URL embeds the seat's secret token and is the only way a
-  // remote player can claim that seat.
+  // friend. Always build the URL from window.location.origin -- the server's
+  // claimLink.url is derived from MAHJONG_PUBLIC_BASE_URL which defaults to
+  // "local://mahjong" and would be unshareable.
   if (opts.context === 'create' && ownToken) {
-    const claimLink = (state.lobbyClaimLinks || []).find((l) => l.seatIndex === seatIndex);
-    const url = claimLink ? claimLink.url
-      : `${location.origin}/?room=${state.lobbyRoomCode}&seat=${seatIndex}&token=${ownToken}`;
+    const url = buildSeatUrl(state.lobbyRoomCode, seatIndex, ownToken);
     const copy = document.createElement('button');
     copy.type = 'button';
     copy.className = 'secondary';
@@ -168,12 +320,7 @@ function renderSeatCard(seatIndex, snapshot, opts) {
     copy.style.margin = '0';
     copy.textContent = 'Copy link';
     copy.title = url;
-    copy.addEventListener('click', () => {
-      navigator.clipboard.writeText(url).then(
-        () => { copy.textContent = 'Copied'; setTimeout(() => { copy.textContent = 'Copy link'; }, 1500); },
-        () => alert('Clipboard failed -- URL:\n' + url)
-      );
-    });
+    copy.addEventListener('click', () => copyToClipboard(url, copy, 'Copy link'));
     actions.appendChild(copy);
   }
 
@@ -315,6 +462,9 @@ function setupLobby() {
     if (!code || !token || isNaN(seat)) { alert('Room code, seat index, and seat token are required.'); return; }
     try {
       const claim = await apiClaimSeat(code, seat, token, name);
+      // Persist this token so the in-room Invite modal can offer this seat.
+      state.lobbyRoomCode = code;
+      state.lobbyTokens[seat] = token;
       stopLobbyPolling();
       enterRoom(claim.roomCode, seat, claim.sessionToken);
     } catch (e) {
@@ -324,9 +474,29 @@ function setupLobby() {
   $('spectateBtn').addEventListener('click', () => {
     const code = $('joinRoomCode').value.trim().toUpperCase();
     if (!code) { alert('Enter a room code to spectate.'); return; }
+    state.lobbyRoomCode = code;
     stopLobbyPolling();
     enterRoom(code, null, null);
   });
+  // ---- Invite modal (in-table) ----
+  const inviteBtn = $('inviteBtn');
+  const inviteModal = $('inviteModal');
+  const inviteCloseBtn = $('inviteCloseBtn');
+  const inviteCopyAllBtn = $('inviteCopyAllBtn');
+  if (inviteBtn && inviteModal) {
+    inviteBtn.addEventListener('click', openInviteModal);
+    inviteCloseBtn.addEventListener('click', closeInviteModal);
+    inviteModal.addEventListener('click', (e) => {
+      if (e.target === inviteModal) closeInviteModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !inviteModal.classList.contains('hidden')) closeInviteModal();
+    });
+    inviteCopyAllBtn.addEventListener('click', () => {
+      const text = buildAllInvitesText();
+      copyToClipboard(text, inviteCopyAllBtn, 'Copy all links');
+    });
+  }
   $('leaveBtn').addEventListener('click', () => {
     if (state.ws) { state.ws.close(); state.ws = null; }
     state.roomCode = null;
@@ -406,9 +576,18 @@ function setupLobby() {
   // can confirm their seat with one click.
   const params = new URLSearchParams(location.search);
   if (params.get('room') && params.get('token')) {
-    $('joinRoomCode').value = params.get('room').toUpperCase();
-    $('joinSeatIndex').value = params.get('seat') || '0';
-    $('joinSeatToken').value = params.get('token');
+    const urlRoom = params.get('room').toUpperCase();
+    const urlSeat = parseInt(params.get('seat') || '0', 10);
+    const urlToken = params.get('token');
+    $('joinRoomCode').value = urlRoom;
+    $('joinSeatIndex').value = String(urlSeat);
+    $('joinSeatToken').value = urlToken;
+    // Remember the token so the in-room Invite modal can offer this seat's
+    // private link (the invitee may need to re-share it later).
+    if (Number.isInteger(urlSeat) && urlSeat >= 0 && urlSeat <= 3) {
+      state.lobbyRoomCode = urlRoom;
+      state.lobbyTokens[urlSeat] = urlToken;
+    }
     refreshJoinSeats();
   }
 }
