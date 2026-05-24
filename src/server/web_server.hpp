@@ -5,6 +5,7 @@
 #include <crow.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -20,7 +21,9 @@ namespace mahjong::server {
 // the process drops in-progress rooms.
 class WebServer {
  public:
-  WebServer(std::string staticDir, std::string publicBaseUrl);
+  WebServer(std::string staticDir, std::string publicBaseUrl,
+            std::chrono::milliseconds idleActMs = std::chrono::milliseconds(10000),
+            std::chrono::milliseconds idleTakeoverMs = std::chrono::milliseconds(90000));
   ~WebServer();
 
   // Blocks until the server stops. Returns the process exit code.
@@ -35,6 +38,12 @@ class WebServer {
 
   std::string staticDir_;
   std::string publicBaseUrl_;
+
+  // Idle-resilience knobs (configured at construction from env vars). The
+  // background AI worker uses these to drive RoomManager::tickIdleHumans so
+  // a disconnected or unresponsive seat does not soft-lock the game.
+  std::chrono::milliseconds idleActMs_;
+  std::chrono::milliseconds idleTakeoverMs_;
 
   RoomManager manager_;
   std::mutex stateMutex_;                // guards manager_ and connection registries
