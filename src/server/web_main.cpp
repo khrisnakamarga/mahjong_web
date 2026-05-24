@@ -1,5 +1,7 @@
 #include "server/web_server.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -44,6 +46,15 @@ int main(int argc, char** argv) {
   const std::string staticDir = parseStringEnv("MAHJONG_WEB_DIR", resolveDefaultStaticDir());
   const std::string publicBaseUrl = parseStringEnv("MAHJONG_PUBLIC_BASE_URL", "");
 
-  mahjong::server::WebServer server(staticDir, publicBaseUrl);
+  // Resiliency knobs. When a human seat hasn't acted for idleActMs and is
+  // blocking the round, the server auto-passes (or picks an AI action) on
+  // their behalf. After idleTakeoverMs the seat fully reverts to AI control;
+  // the human can reclaim by re-using their seat link.
+  const int idleActMs = parseIntEnv("MAHJONG_IDLE_ACT_MS", 10000);
+  const int idleTakeoverMs = parseIntEnv("MAHJONG_IDLE_TAKEOVER_MS", 90000);
+
+  mahjong::server::WebServer server(staticDir, publicBaseUrl,
+                                    std::chrono::milliseconds(std::max(0, idleActMs)),
+                                    std::chrono::milliseconds(std::max(0, idleTakeoverMs)));
   return server.run(port);
 }

@@ -12,6 +12,140 @@ Iterations are listed newest first.
 
 ---
 
+## [Iteration 14] — 2026-05-23 — Server-side soft-lock resiliency
+
+### Context
+A real-world report: during a mobile session, **Christian** had his client-side
+auto-pass toggle ON when **Sanjaya** discarded into a chow/pong window.
+Christian's phone rang before the JS auto-pass timer could fire, the tab was
+backgrounded, and the timer never ran. When he came back, the round was
+soft-locked — his pass button was the only thing that could advance the round,
+but the snapshot version had moved on and no other player could act.
+
+Root cause: `autoPass` was purely client-side. The server's `onClose` only
+unbound the WS, it never released or sanitized the seat. There was no
+server-side idle handling for human-controlled seats, so a single absent human
+could pin a room indefinitely.
+
+### Added
+- **Two-tier server-side idle worker** (env-configurable):
+  - `MAHJONG_IDLE_ACT_MS` (default **10000ms**) — when a human seat has been
+    blocking the round longer than this, the server submits Pass on their
+    behalf (falling back to a safe AI choice if Pass isn't legal, e.g. it's
+    the seat's own draw turn). The controller stays `Human`; the user can
+    come back and resume.
+  - `MAHJONG_IDLE_TAKEOVER_MS` (default **90000ms**) — when a seat has been
+    disconnected (no live WS) for this long, the worker flips
+    `controller = Ai`, clears `sessionTokenHash`, and the AI plays the rest
+    of the round/session. The human can reclaim via the regular HTTP claim
+    flow (force-takeover prompt).
+- **Per-seat liveness tracking** on `RoomSeatRecord`:
+  - `liveConnectionCount` — number of WS tabs currently bound to this seat
+    (multiple tabs allowed; recomputed on close from `connections_`).
+  - `connected` — convenience mirror of `liveConnectionCount > 0`,
+    serialized into the snapshot.
+  - `lastSeatActivityAt` — bumped on claim / hello / ping / action /
+    set_ai_delay / set_auto_pass. Used by the takeover-confirm guard and
+    by the AI revert trigger.
+  - `pendingActionSince` + `pendingActionVersion` — the moment this seat
+    first saw non-empty legal actions at the current `room.version`.
+    **Pings and hello deliberately do NOT touch these**, so a frozen tab
+    that still ships keepalives still trips the auto-pass.
+- **Takeover-confirm flow** on `claimSeat`:
+  - New `forceTakeover=false` parameter.
+  - Throws new `SeatInUseError` when the seat is human-controlled, has at
+    least one live connection, AND showed activity within the last 5 seconds.
+  - HTTP route returns **409** with body `{"error":"seat_in_use","message":...}`.
+  - Client wraps every claim in `claimSeatWithTakeoverPrompt(...)`: catches
+    409, shows `window.confirm("Someone is already playing on this seat
+    right now. Take over their spot anyway?")`, then retries with
+    `forceTakeover=true`.
+  - Displaced WS receives a proactive
+    `{"type":"error","code":"session_invalidated","message":...}` so the old
+    client immediately bounces back to the lobby instead of spinning on
+    stale-token actions.
+- **Internal idle-recovery submission convention** on `submitSeatAction`:
+  - Calling with `sessionToken=std::nullopt` and `Controller::Human`
+    bypasses the session-token check. This is how the idle worker submits
+    Pass on behalf of an absent human without needing a fake credential.
+- **New `RoomManager` methods**: `listRoomCodes`, `setSeatConnectionCount`,
+  `noteSeatActivity`, `isSeatActivelyHeld`, `tickIdleHumans` (returns
+  `IdleTickOutcome` with seats-converted-to-AI list), `nextIdleDueAt`.
+- **Three new Python e2e tests** (each spawns its own server with tight
+  thresholds, all passing):
+  - `tests/test_e2e_soft_lock_recovery.py` — `idleActMs=400`. Claims seat 0,
+    opens WS, then stays completely silent for 6 seconds. Asserts the
+    snapshot version advances on its own (validated run: **16 unique
+    versions seen** while the human did nothing). This is the regression
+    test for the Christian/Sanjaya scenario.
+  - `tests/test_e2e_seat_takeover_confirm.py` — Claims + WS hello, then
+    second claim returns **409 `seat_in_use`**. Retry with
+    `forceTakeover=true` succeeds with a new sessionToken, and the original
+    WS receives a `session_invalidated` error frame.
+  - `tests/test_e2e_ai_revert_on_long_idle.py` — `idleTakeoverMs=1200`.
+    Claims without ever opening a WS, waits 4s, asserts seat 0 controller
+    flipped to `ai` AND that the human's `displayName` is preserved
+    (the identity stays visible; only the controller changes).
+
+### Changed
+- **AI worker rewrite** (`runAiWorker`):
+  - Now iterates **every** room via `manager_.listRoomCodes()` — previously
+    only iterated rooms with at least one live WS connection, so a room
+    where all humans dropped off would never tick again. Snapshot
+    broadcasts still go only to rooms that have live connections.
+  - Always calls `tickIdleHumans` per cycle (the `pendingActionSince`
+    markers it needs are seeded *on the first call*, not by
+    `nextIdleDueAt`).
+  - After a seat is converted to AI, the worker pushes a
+    `session_invalidated` error frame to any WS still bound to that seat's
+    session token, then clears the binding server-side.
+- **WebServer constructor** now accepts `idleActMs` /
+  `idleTakeoverMs` (both `std::chrono::milliseconds`). `web_main.cpp`
+  reads them from the new env vars and forwards.
+- **`onClose`** recomputes the seat's `liveConnectionCount` from the
+  remaining matching connections (not a naive decrement), so multi-tab
+  users don't accidentally null themselves out.
+- **`onMessage`** for `hello` / `ping` / `action` / `set_ai_delay` /
+  `set_auto_pass` calls `noteSeatActivity` so the activity timer reflects
+  real engagement.
+- **Error code rename**: human-seat session-token mismatches now report
+  `session_invalidated` (was `unauthorized`). The client's WS handler
+  treats this code (and `room_evicted`) as "drop session creds and return
+  to lobby" via a new `forceLeaveTableToLobby(message)` helper.
+
+### Files changed
+- `src/server/room_server.{hpp,cpp}` — new state fields,
+  `SeatInUseError`, takeover guard, internal-bypass submit path,
+  `tickIdleHumans` + `nextIdleDueAt` implementations.
+- `src/server/web_server.{hpp,cpp}` — constructor params, AI worker
+  rewrite, 409 handling, `session_invalidated` push, `noteSeatActivity`
+  wiring, `onClose` connection-count recompute.
+- `src/server/web_main.cpp` — env-var parsing for `MAHJONG_IDLE_ACT_MS`
+  and `MAHJONG_IDLE_TAKEOVER_MS`.
+- `web/app.js` — `claimSeatWithTakeoverPrompt` wrapper around
+  `apiClaimSeat`, `forceLeaveTableToLobby` helper, WS error handler for
+  `session_invalidated` / `room_evicted`.
+- `tests/test_e2e_soft_lock_recovery.py`,
+  `tests/test_e2e_seat_takeover_confirm.py`,
+  `tests/test_e2e_ai_revert_on_long_idle.py` — three new e2e tests.
+
+### Validation
+- **3 new e2e tests**: PASS.
+- **10 prior e2e tests** all still PASS: `ai_delay`, `auto_pass`,
+  `autopass_and_history`, `chicken_hand`, `invite_links`, `mobile_ui`,
+  `seat_grid_lobby`, `tile_rendering`, `win_conclusion`, `you_label`.
+- **12 C++ unit tests** PASS.
+- **34 JS unit subtests** PASS.
+
+### Deploy notes
+**This deploy requires a fresh container build** — unlike prior client-only
+rounds, server C++ code changed. Run `scripts\azd-redeploy.ps1 -Deploy`
+from the UNC checkout under your Azure account; the Dockerfile will
+recompile from source. Defaults of `MAHJONG_IDLE_ACT_MS=10000` and
+`MAHJONG_IDLE_TAKEOVER_MS=90000` need no further configuration.
+
+---
+
 ## [Iteration 13] — 2026-05-22 — Tile redesign + clickable seat-grid lobby
 
 ### Added

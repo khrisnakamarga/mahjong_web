@@ -5,6 +5,7 @@
 #include <chrono>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,32 @@ struct RoomSeatRecord {
   std::string displayName;
   std::string claimTokenHash;
   std::optional<std::string> sessionTokenHash;
+  // Number of live WebSocket connections currently bound to this seat with a
+  // matching sessionToken. Maintained by WebServer via setSeatConnectionCount
+  // on hello / close. >0 means at least one browser tab actively holds the
+  // seat. Used by claimSeat's "seat in use" guard and by tickIdleHumans to
+  // decide between auto-pass (still connected) and full AI takeover
+  // (disconnected too long).
+  int liveConnectionCount{0};
+  // Convenience: true iff liveConnectionCount > 0. Mirrored into snapshots so
+  // the lobby can show "Active" vs "Idle" badges.
   bool connected{};
+  // Steady-clock timestamp of the last activity by this seat's owner over
+  // WebSocket (hello, ping, action, set_auto_pass, set_ai_delay). Updated by
+  // RoomManager::noteSeatActivity. Used as a tie-breaker by claimSeat's
+  // takeover grace period.
+  std::chrono::steady_clock::time_point lastSeatActivityAt{};
+  // When the seat first had a non-empty legalActions list at the current room
+  // version (i.e., became "blocking the game waiting for this seat's input").
+  // Cleared when legalActions become empty or when the seat acts. Drives the
+  // idle-act and idle-takeover deadlines independently of WS pings -- a tab
+  // that is alive but frozen will still hit these deadlines because the
+  // pendingAction was never resolved.
+  std::chrono::steady_clock::time_point pendingActionSince{};
+  // Room version at which pendingActionSince was last recomputed. When the
+  // current room.version moves past this, the worker resets pendingActionSince
+  // to "now" -- i.e., each new claim window or turn gets its own grace period.
+  int pendingActionVersion{-1};
 };
 
 struct RoomRecord {
@@ -69,6 +95,18 @@ struct CreateRoomResult {
 struct ClaimSeatResult {
   RoomRecord room;
   std::string sessionToken;
+  // Old session token hash that was just invalidated (if any). The WebServer
+  // uses this to find existing WS connections to the same seat and push a
+  // session_invalidated error before silently demoting them.
+  std::optional<std::string> displacedSessionTokenHash;
+};
+
+// Thrown by RoomManager::claimSeat when a seat is currently held by a live
+// WebSocket connection and the caller did not pass forceTakeover=true.
+// The WebServer maps this to HTTP 409 with error code "seat_in_use".
+class SeatInUseError : public std::runtime_error {
+ public:
+  explicit SeatInUseError(const std::string& msg) : std::runtime_error(msg) {}
 };
 
 struct PublicPlayerSnapshot {
@@ -122,7 +160,7 @@ class RoomManager {
   CreateRoomResult createRoom(const std::string& seed = "");
   std::optional<RoomRecord> getRoom(const std::string& roomCode) const;
   std::vector<RoomRecord> listRooms() const;
-  ClaimSeatResult claimSeat(const std::string& roomCode, int seatIndex, const std::string& claimToken, const std::string& displayName);
+  ClaimSeatResult claimSeat(const std::string& roomCode, int seatIndex, const std::string& claimToken, const std::string& displayName, bool forceTakeover = false);
   RoomSnapshot createSnapshot(const RoomRecord& room, std::optional<int> viewerSeatIndex = std::nullopt) const;
   SubmitActionResult submitHumanAction(const std::string& roomCode, int seatIndex, const std::string& sessionToken, int expectedVersion, const LegalAction& action);
   SubmitActionResult submitAiAction(const std::string& roomCode, int seatIndex, int expectedVersion, const LegalAction& action);
@@ -170,6 +208,69 @@ class RoomManager {
   // without going through createRoom's deterministic deal. Production code
   // should never call this.
   void injectRoomForTest(const RoomRecord& room) { rooms_[room.roomCode] = room; }
+
+  // ---------- Per-seat liveness tracking (called by WebServer) ----------
+
+  // Lists the current room codes (a snapshot copy so callers can iterate
+  // without holding the manager's lock if they don't need consistency).
+  std::vector<std::string> listRoomCodes() const;
+
+  // Sets the live WebSocket connection count for a given seat. Maintains
+  // both seat.liveConnectionCount and the convenience seat.connected flag.
+  // When the count drops to 0 the next tickIdleHumans pass can advance the
+  // idle deadline; when it returns to >0 the seat is considered actively
+  // owned again. No-op if the room or seat does not exist.
+  void setSeatConnectionCount(const std::string& roomCode, int seatIndex, int count);
+
+  // Bumps the seat's lastSeatActivityAt timestamp. Called by WebServer on
+  // any inbound WS message bound to this seat (hello, action, ping, setting
+  // change). Used as a tie-breaker by claimSeat's takeover grace window.
+  // No-op if the room or seat does not exist.
+  void noteSeatActivity(const std::string& roomCode, int seatIndex);
+
+  // Returns true if the seat is currently considered actively held by a
+  // live owner: liveConnectionCount > 0 AND the most recent seat activity
+  // is newer than (now - graceMs). Used by WebServer's claimSeat handler to
+  // decide whether to surface the seat_in_use 409 to the caller.
+  // No-op (returns false) if the room or seat does not exist.
+  bool isSeatActivelyHeld(const std::string& roomCode, int seatIndex,
+                          std::chrono::steady_clock::time_point now,
+                          std::chrono::milliseconds graceMs) const;
+
+  // ---------- Idle-seat resilience (called by WebServer's AI worker) ----
+
+  struct IdleTickOutcome {
+    bool changed{false};
+    // Seats that just had their controller flipped from Human to Ai (full
+    // takeover). The caller should broadcast the room snapshot AND push a
+    // session_invalidated error to any old WS connections holding that
+    // seat so the displaced browser knows it was kicked.
+    std::vector<int> seatsConvertedToAi;
+  };
+
+  // For each Human seat in `roomCode`, checks how long it has been blocking
+  // on a pending decision (a non-empty legalActions list at the current
+  // version). When the block exceeds idleActMs we submit a "pass" on the
+  // seat's behalf (or, if pass is not legal, a deterministic AI action so
+  // the seat's own turn can advance). When the block exceeds idleTakeoverMs
+  // OR the seat has been disconnected for that long, we flip the seat's
+  // controller to Ai so the normal AI worker resumes play for the rest of
+  // the round; the human can later reclaim by re-using their seat token.
+  //
+  // Returns IdleTickOutcome.changed = true if anything mutated; the worker
+  // should re-broadcast in that case.
+  IdleTickOutcome tickIdleHumans(const std::string& roomCode,
+                                 std::chrono::milliseconds idleActMs,
+                                 std::chrono::milliseconds idleTakeoverMs);
+
+  // Returns when the next idle deadline (auto-pass or takeover) is due in
+  // this room, or nullopt if no human seat is currently blocking. Used by
+  // the worker to size its wait_for window so idle recovery wakes up
+  // promptly even when there are no AI moves pending.
+  std::optional<std::chrono::steady_clock::time_point> nextIdleDueAt(
+      const std::string& roomCode,
+      std::chrono::milliseconds idleActMs,
+      std::chrono::milliseconds idleTakeoverMs) const;
 
   // Evicts rooms that have been idle past their TTL, then if still over
   // maxRooms, evicts the oldest by lastActivityAt until at maxRooms.

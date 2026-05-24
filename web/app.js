@@ -42,15 +42,39 @@ async function apiCreateRoom() {
   if (!r.ok) throw new Error('create_room failed: ' + r.status);
   return await r.json();
 }
-async function apiClaimSeat(code, seat, token, displayName) {
+async function apiClaimSeat(code, seat, token, displayName, forceTakeover = false) {
   const r = await fetch(`/api/rooms/${code}/seats/${seat}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token, displayName }),
+    body: JSON.stringify({ token, displayName, forceTakeover }),
   });
-  const body = await r.json();
-  if (!r.ok) throw new Error(body.message || 'claim failed');
+  const body = await r.json().catch(() => ({}));
+  if (r.status === 409 && body && body.error === 'seat_in_use') {
+    const err = new Error(body.message || 'seat_in_use');
+    err.code = 'seat_in_use';
+    err.status = 409;
+    throw err;
+  }
+  if (!r.ok) throw new Error(body.message || ('claim failed: ' + r.status));
   return body;
+}
+
+// Wrap a claimSeat call so that if the seat is actively held by another
+// human, we ask the user to confirm before forcing them out.
+async function claimSeatWithTakeoverPrompt(code, seat, token, displayName) {
+  try {
+    return await apiClaimSeat(code, seat, token, displayName, false);
+  } catch (err) {
+    if (err && err.code === 'seat_in_use') {
+      const ok = window.confirm(
+        'Someone is already playing on this seat right now. Take over their spot anyway?\n\n' +
+        'They will be sent back to the lobby.'
+      );
+      if (!ok) throw err;
+      return await apiClaimSeat(code, seat, token, displayName, true);
+    }
+    throw err;
+  }
 }
 
 // ---------- Lobby UI ----------
@@ -390,11 +414,13 @@ async function joinAsSeat(seatIndex, token) {
   if (!name && joinName) name = (joinName.value || '').trim();
   if (!name) name = SEAT_LABELS[seatIndex] || 'Player';
   try {
-    const claim = await apiClaimSeat(code, seatIndex, token, name);
+    const claim = await claimSeatWithTakeoverPrompt(code, seatIndex, token, name);
     stopLobbyPolling();
     enterRoom(claim.roomCode, seatIndex, claim.sessionToken);
   } catch (e) {
-    alert('Join failed: ' + (e && e.message ? e.message : e));
+    if (!(e && e.code === 'seat_in_use')) {
+      alert('Join failed: ' + (e && e.message ? e.message : e));
+    }
     // Refresh the grid so it shows the new occupancy state.
     apiGetRoom(code).then((snap) => { if (snap) { state.lobbySnapshot = snap; renderSeatGrids(); } });
   }
@@ -461,14 +487,16 @@ function setupLobby() {
     const name = $('joinDisplayName').value.trim() || 'Player';
     if (!code || !token || isNaN(seat)) { alert('Room code, seat index, and seat token are required.'); return; }
     try {
-      const claim = await apiClaimSeat(code, seat, token, name);
+      const claim = await claimSeatWithTakeoverPrompt(code, seat, token, name);
       // Persist this token so the in-room Invite modal can offer this seat.
       state.lobbyRoomCode = code;
       state.lobbyTokens[seat] = token;
       stopLobbyPolling();
       enterRoom(claim.roomCode, seat, claim.sessionToken);
     } catch (e) {
-      alert('Join failed: ' + e.message);
+      if (!(e && e.code === 'seat_in_use')) {
+        alert('Join failed: ' + e.message);
+      }
     }
   });
   $('spectateBtn').addEventListener('click', () => {
@@ -622,6 +650,17 @@ function enterRoom(roomCode, seatIndex, sessionToken) {
       onSnapshot(msg.snapshot);
     } else if (msg.type === 'error') {
       console.warn('server error', msg);
+      if (msg.code === 'session_invalidated') {
+        // Another client took over our seat (or the server explicitly evicted
+        // us). Drop our session creds and bounce back to the lobby so the
+        // user can rejoin with a fresh seat or as a spectator.
+        forceLeaveTableToLobby('Another player has taken over this seat. You\'ve been returned to the lobby.');
+        return;
+      }
+      if (msg.code === 'room_evicted') {
+        forceLeaveTableToLobby('This room was closed due to inactivity. Please create or join a new room.');
+        return;
+      }
       flashError(`${msg.code}: ${msg.message}`);
     } else if (msg.type === 'pong') {
       // ok
@@ -642,6 +681,26 @@ function flashError(message) {
   el.style.color = '#ffb4b4';
   el.textContent = '⚠ ' + message;
   setTimeout(() => { el.style.color = ''; el.textContent = prev; }, 3000);
+}
+
+// Disconnect from the room, reset session creds, and return the user to the
+// lobby view. Used when the server tells us our session is no longer valid
+// (seat taken over, room evicted, etc.).
+function forceLeaveTableToLobby(message) {
+  try { if (state.ws) state.ws.close(); } catch (_) {}
+  state.ws = null;
+  state.roomCode = null;
+  state.seatIndex = null;
+  state.sessionToken = null;
+  state.snapshot = null;
+  const tbl = $('table');
+  const lobby = $('lobby');
+  if (tbl) tbl.classList.add('hidden');
+  if (lobby) lobby.classList.remove('hidden');
+  history.replaceState(null, '', location.pathname);
+  if (message) {
+    try { alert(message); } catch (_) { console.warn(message); }
+  }
 }
 
 function sendAction(action) {

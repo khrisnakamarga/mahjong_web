@@ -54,9 +54,13 @@ crow::response jsonOk(json body) { return jsonResponse(200, std::move(body)); }
 
 } // namespace
 
-WebServer::WebServer(std::string staticDir, std::string publicBaseUrl)
+WebServer::WebServer(std::string staticDir, std::string publicBaseUrl,
+                     std::chrono::milliseconds idleActMs,
+                     std::chrono::milliseconds idleTakeoverMs)
     : staticDir_(std::move(staticDir)),
       publicBaseUrl_(std::move(publicBaseUrl)),
+      idleActMs_(idleActMs),
+      idleTakeoverMs_(idleTakeoverMs),
       manager_(publicBaseUrl_.empty() ? std::string("local://mahjong") : publicBaseUrl_) {
   // Env-driven cleanup tuning. All values are seconds, room count for maxRooms.
   auto readPositiveEnv = [](const char* name, long long fallback) -> long long {
@@ -75,6 +79,8 @@ WebServer::WebServer(std::string staticDir, std::string publicBaseUrl)
             << " ttlActive=" << ttlActive_.count() << "s"
             << " interval=" << cleanupIntervalSec_.count() << "s"
             << " maxRooms=" << maxRooms_ << std::endl;
+  std::cout << "[resiliency] idleActMs=" << idleActMs_.count()
+            << " idleTakeoverMs=" << idleTakeoverMs_.count() << std::endl;
 
   registerRoutes();
   aiWorker_ = std::thread([this] { runAiWorker(); });
@@ -129,36 +135,75 @@ void WebServer::runAiWorker() {
   using namespace std::chrono_literals;
   while (!aiWorkerStop_.load()) {
     std::unique_lock<std::mutex> lock(stateMutex_);
-    // Find the earliest pending AI deadline across all rooms.
+    // Find the earliest pending deadline across all rooms (AI move OR idle
+    // recovery). We iterate ALL rooms, not just rooms with WS connections,
+    // so that an unattended seat still gets auto-passed / converted to AI
+    // even when the last human disconnects. Broadcasts are only sent to
+    // rooms that actually have live connections.
     auto now = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point earliest = now + std::chrono::seconds(60);
     bool anyPending = false;
-    std::vector<std::string> rooms;
-    rooms.reserve(roomConnections_.size());
-    for (const auto& [code, _conns] : roomConnections_) rooms.push_back(code);
-    // Tick due rooms.
+    const auto rooms = manager_.listRoomCodes();
+
+    auto broadcastIfConnected = [&](const std::string& code) {
+      const auto it = roomConnections_.find(code);
+      if (it == roomConnections_.end()) return;
+      for (auto* conn : it->second) {
+        const auto cit = connections_.find(conn);
+        if (cit == connections_.end()) continue;
+        sendSnapshotLocked(*conn, cit->second);
+      }
+    };
+
+    // ---- Tick due AI moves and idle recoveries ----
     for (const auto& code : rooms) {
-      auto due = manager_.nextAiDueAt(code);
-      if (!due) continue;
-      anyPending = true;
-      if (*due <= now) {
-        // Run a single AI step; broadcast if anything changed.
-        if (manager_.tickAi(code)) {
-          // broadcastRoom sends a fresh snapshot to every connection in code.
-          const auto it = roomConnections_.find(code);
-          if (it != roomConnections_.end()) {
-            for (auto* conn : it->second) {
-              const auto cit = connections_.find(conn);
-              if (cit == connections_.end()) continue;
-              sendSnapshotLocked(*conn, cit->second);
-            }
+      // 1) Normal AI cascade for AI-controlled seats.
+      auto aiDue = manager_.nextAiDueAt(code);
+      if (aiDue) {
+        anyPending = true;
+        if (*aiDue <= now) {
+          if (manager_.tickAi(code)) broadcastIfConnected(code);
+          auto next = manager_.nextAiDueAt(code);
+          if (next && *next < earliest) earliest = *next;
+        } else if (*aiDue < earliest) {
+          earliest = *aiDue;
+        }
+      }
+
+      // 2) Idle resilience: auto-pass or AI-takeover human seats that have
+      //    been blocking the round too long. Always run a tick: the function
+      //    is a cheap no-op when no human seat has pending actions, and a
+      //    single tick is needed to *seed* the pendingActionSince markers
+      //    that nextIdleDueAt relies on. After the tick, query for the next
+      //    deadline so we can sleep efficiently.
+      auto outcome = manager_.tickIdleHumans(code, idleActMs_, idleTakeoverMs_);
+      if (outcome.changed) broadcastIfConnected(code);
+      // Push session_invalidated to any WS connections still bound to a
+      // seat that just got converted to AI so the displaced browser can
+      // gracefully demote itself instead of issuing further stale-token
+      // actions.
+      if (!outcome.seatsConvertedToAi.empty()) {
+        const auto cit = roomConnections_.find(code);
+        if (cit != roomConnections_.end()) {
+          for (auto* conn : cit->second) {
+            const auto sit = connections_.find(conn);
+            if (sit == connections_.end()) continue;
+            if (!sit->second.seatIndex) continue;
+            const int s = *sit->second.seatIndex;
+            if (std::find(outcome.seatsConvertedToAi.begin(),
+                          outcome.seatsConvertedToAi.end(), s) ==
+                outcome.seatsConvertedToAi.end()) continue;
+            sendError(*conn, "session_invalidated",
+                      "You were idle too long; the AI has taken over your seat. Reconnect via your seat link to reclaim.");
+            sit->second.seatIndex.reset();
+            sit->second.sessionToken.clear();
           }
         }
-        // Re-fetch the next due time for this room.
-        auto next = manager_.nextAiDueAt(code);
-        if (next && *next < earliest) earliest = *next;
-      } else if (*due < earliest) {
-        earliest = *due;
+      }
+      auto idleDue = manager_.nextIdleDueAt(code, idleActMs_, idleTakeoverMs_);
+      if (idleDue) {
+        anyPending = true;
+        if (*idleDue < earliest) earliest = *idleDue;
       }
     }
     if (aiWorkerStop_.load()) break;
@@ -234,10 +279,30 @@ void WebServer::registerRoutes() {
         try { body = json::parse(req.body); } catch (...) { return jsonResponse(400, {{"error", "bad_json"}}); }
         const auto token = body.value("token", std::string{});
         const auto displayName = body.value("displayName", std::string{});
+        const bool forceTakeover = body.value("forceTakeover", false);
         if (token.empty()) return jsonResponse(400, {{"error", "missing_token"}});
         try {
           std::lock_guard<std::mutex> lock(stateMutex_);
-          const auto result = manager_.claimSeat(code, seat, token, displayName);
+          const auto result = manager_.claimSeat(code, seat, token, displayName, forceTakeover);
+          // Eject any existing WS connections that were bound to this seat
+          // with the now-invalidated session token. They get a structured
+          // error so the browser can demote itself instead of issuing further
+          // stale-token actions.
+          if (result.displacedSessionTokenHash) {
+            const auto it = roomConnections_.find(result.room.roomCode);
+            if (it != roomConnections_.end()) {
+              for (auto* conn : it->second) {
+                const auto cit = connections_.find(conn);
+                if (cit == connections_.end()) continue;
+                if (!cit->second.seatIndex || *cit->second.seatIndex != seat) continue;
+                if (cit->second.sessionToken == result.sessionToken) continue;
+                sendError(*conn, "session_invalidated",
+                          "Another player took over your seat. You have been demoted to spectator.");
+                cit->second.seatIndex.reset();
+                cit->second.sessionToken.clear();
+              }
+            }
+          }
           // Push a fresh snapshot to every WS connection already in the
           // room so they see the new player name immediately (rather than
           // waiting for the next AI move / setting toggle to trigger a
@@ -249,6 +314,8 @@ void WebServer::registerRoutes() {
               {"seatIndex", seat},
               {"sessionToken", result.sessionToken},
           });
+        } catch (const SeatInUseError& error) {
+          return jsonResponse(409, {{"error", "seat_in_use"}, {"message", error.what()}});
         } catch (const std::exception& error) {
           return jsonResponse(403, {{"error", "claim_failed"}, {"message", error.what()}});
         }
@@ -280,6 +347,23 @@ void WebServer::onClose(crow::websocket::connection& conn, const std::string& /*
     auto& set = roomConnections_[it->second.roomCode];
     set.erase(&conn);
     if (set.empty()) roomConnections_.erase(it->second.roomCode);
+    // Recompute the per-seat live-connection count for the seat this
+    // connection was bound to. We can't simply decrement because there may
+    // have been parallel browsers (desktop + mobile) for the same seat;
+    // counting the remaining matching connections is authoritative.
+    if (it->second.seatIndex) {
+      const int seat = *it->second.seatIndex;
+      int remaining = 0;
+      const auto cit = roomConnections_.find(it->second.roomCode);
+      if (cit != roomConnections_.end()) {
+        for (auto* other : cit->second) {
+          const auto oit = connections_.find(other);
+          if (oit == connections_.end()) continue;
+          if (oit->second.seatIndex && *oit->second.seatIndex == seat) remaining++;
+        }
+      }
+      manager_.setSeatConnectionCount(it->second.roomCode, seat, remaining);
+    }
   }
   connections_.erase(it);
 }
@@ -292,6 +376,14 @@ void WebServer::onMessage(crow::websocket::connection& conn, const std::string& 
   const auto type = message.value("type", std::string{});
   if (type == "ping") {
     conn.send_text(json{{"type", "pong"}}.dump());
+    // Pings count as liveness for the seat. We deliberately do NOT reset the
+    // pendingActionSince deadline here -- a frozen tab can still send pings;
+    // the only thing that resolves a pending decision is a real action.
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    const auto it = connections_.find(&conn);
+    if (it != connections_.end() && it->second.seatIndex && !it->second.roomCode.empty()) {
+      manager_.noteSeatActivity(it->second.roomCode, *it->second.seatIndex);
+    }
     return;
   }
 
@@ -322,6 +414,18 @@ void WebServer::onMessage(crow::websocket::connection& conn, const std::string& 
     state.sessionToken = sessionToken;
     roomConnections_[roomCode].insert(&conn);
     manager_.touchRoom(roomCode);
+    // Bump per-seat liveness so the idle worker resets its deadline and so
+    // claimSeat treats the seat as actively held against silent overrides.
+    if (seatIndex) {
+      int liveCount = 0;
+      for (auto* other : roomConnections_[roomCode]) {
+        const auto oit = connections_.find(other);
+        if (oit == connections_.end()) continue;
+        if (oit->second.seatIndex && *oit->second.seatIndex == *seatIndex) liveCount++;
+      }
+      manager_.setSeatConnectionCount(roomCode, *seatIndex, liveCount);
+      manager_.noteSeatActivity(roomCode, *seatIndex);
+    }
 
     json welcome{
         {"type", "welcome"},
@@ -350,10 +454,18 @@ void WebServer::onMessage(crow::websocket::connection& conn, const std::string& 
     const auto result = manager_.submitHumanAction(state.roomCode, *state.seatIndex, state.sessionToken, expectedVersion, *parsed);
     if (!result.ok) {
       sendError(conn, result.code, result.message);
+      // If the failure was due to session takeover, drop the seat binding so
+      // we don't keep submitting stale-token actions and so any UI logic that
+      // reacts to spectator demotion works correctly.
+      if (result.code == "session_invalidated") {
+        it->second.seatIndex.reset();
+        it->second.sessionToken.clear();
+      }
       // Still resync the connection so it gets the latest snapshot/version.
-      sendSnapshotLocked(conn, state);
+      sendSnapshotLocked(conn, it->second);
       return;
     }
+    manager_.noteSeatActivity(state.roomCode, *state.seatIndex);
     broadcastRoom(state.roomCode);
     aiWorkerCv_.notify_all();
     return;
@@ -372,6 +484,7 @@ void WebServer::onMessage(crow::websocket::connection& conn, const std::string& 
     if (!manager_.setAiDelayMs(state.roomCode, delayMs)) {
       sendError(conn, "not_found", "Room does not exist"); return;
     }
+    if (state.seatIndex) manager_.noteSeatActivity(state.roomCode, *state.seatIndex);
     broadcastRoom(state.roomCode);
     aiWorkerCv_.notify_all();
     return;
@@ -388,6 +501,7 @@ void WebServer::onMessage(crow::websocket::connection& conn, const std::string& 
     if (!manager_.setAutoPass(state.roomCode, value)) {
       sendError(conn, "not_found", "Room does not exist"); return;
     }
+    if (state.seatIndex) manager_.noteSeatActivity(state.roomCode, *state.seatIndex);
     broadcastRoom(state.roomCode);
     return;
   }

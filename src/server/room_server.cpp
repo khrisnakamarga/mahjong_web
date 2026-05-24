@@ -121,7 +121,7 @@ std::vector<RoomRecord> RoomManager::listRooms() const {
   return rooms;
 }
 
-ClaimSeatResult RoomManager::claimSeat(const std::string& roomCode, int seatIndex, const std::string& claimToken, const std::string& displayName) {
+ClaimSeatResult RoomManager::claimSeat(const std::string& roomCode, int seatIndex, const std::string& claimToken, const std::string& displayName, bool forceTakeover) {
   const auto normalized = normalizeRoomCode(roomCode);
   auto it = rooms_.find(normalized);
   if (it == rooms_.end()) throw std::runtime_error("Room not found");
@@ -129,17 +129,40 @@ ClaimSeatResult RoomManager::claimSeat(const std::string& roomCode, int seatInde
   auto& room = it->second;
   auto& seat = room.seats[static_cast<std::size_t>(seatIndex)];
   if (seat.claimTokenHash != hashToken(claimToken)) throw std::runtime_error("Invalid private seat claim token");
+  // Active-seat guard: refuse to silently displace a live human player. A seat
+  // is "actively held" when at least one live WebSocket is bound to it AND we
+  // saw owner activity within the last few seconds (so a frozen background
+  // tab whose timers stopped firing is NOT considered active and can be
+  // recovered without confirmation). The caller can override by passing
+  // forceTakeover=true (the frontend asks the user for explicit confirm).
+  if (!forceTakeover && seat.controller == Controller::Human && seat.liveConnectionCount > 0) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto grace = std::chrono::seconds(5);
+    if (seat.lastSeatActivityAt.time_since_epoch().count() > 0 &&
+        now - seat.lastSeatActivityAt < grace) {
+      throw SeatInUseError("Seat is currently held by another player. Confirm takeover to override.");
+    }
+  }
+  const auto displaced = seat.sessionTokenHash;
   const auto sessionToken = randomToken();
   seat.controller = Controller::Human;
   seat.displayName = displayName.empty() ? "Player " + std::to_string(seatIndex + 1) : displayName;
   seat.sessionTokenHash = hashToken(sessionToken);
+  // Reset connection and idle state: the new owner is reconnecting from
+  // scratch. The WebServer will bump liveConnectionCount on the subsequent
+  // hello. We also reset the pending-action deadline so the new owner gets a
+  // full grace window before the idle worker can act for them.
+  seat.liveConnectionCount = 0;
   seat.connected = false;
+  seat.lastSeatActivityAt = std::chrono::steady_clock::now();
+  seat.pendingActionSince = std::chrono::steady_clock::time_point{};
+  seat.pendingActionVersion = -1;
   room.roundState = updateRoundPlayerIdentity(room.roundState, seat);
   room.version += 1;
   room.lastActivityAt = std::chrono::steady_clock::now();
   if (room.aiDelayMs <= 0) scheduleAiForRoomSync(room);
   else refreshAiPending(room);
-  return {room, sessionToken};
+  return {room, sessionToken, displaced};
 }
 
 RoomSnapshot RoomManager::createSnapshot(const RoomRecord& room, std::optional<int> viewerSeatIndex) const {
@@ -202,7 +225,13 @@ SubmitActionResult RoomManager::submitSeatAction(const std::string& roomCode, in
   auto& room = it->second;
   if (seatIndex < 0 || seatIndex >= 4) return {false, "unauthorized", "Invalid seat", room};
   const auto& seat = room.seats[static_cast<std::size_t>(seatIndex)];
-  if (actor == Controller::Human && (!sessionToken || !isSessionAuthorized(seat, *sessionToken))) return {false, "unauthorized", "Unauthorized seat session", room};
+  // Authorization rules:
+  //   - actor=Human, sessionToken set        -> normal browser-initiated action: validate token.
+  //   - actor=Human, sessionToken == nullopt -> internal idle-recovery action submitted by
+  //                                             tickIdleHumans on behalf of an absent player;
+  //                                             bypasses session check (the worker is trusted).
+  //   - actor=Ai                             -> the seat must currently be Ai-controlled.
+  if (actor == Controller::Human && sessionToken && !isSessionAuthorized(seat, *sessionToken)) return {false, "session_invalidated", "Seat session no longer valid", room};
   if (actor == Controller::Ai && seat.controller != Controller::Ai) return {false, "unauthorized", "AI hook cannot act for a human seat", room};
   if (expectedVersion != room.version) return {false, "stale_version", "Stale room version", room};
   const auto legalActions = roomLegalActions(room, seatIndex);
@@ -488,4 +517,203 @@ std::vector<std::string> RoomManager::evictIdleRooms(
   return evicted;
 }
 
-} // namespace mahjong::server
+// ===================== Per-seat liveness =====================
+
+std::vector<std::string> RoomManager::listRoomCodes() const {
+  std::vector<std::string> codes;
+  codes.reserve(rooms_.size());
+  for (const auto& [code, _room] : rooms_) codes.push_back(code);
+  return codes;
+}
+
+void RoomManager::setSeatConnectionCount(const std::string& roomCode, int seatIndex, int count) {
+  const auto normalized = normalizeRoomCode(roomCode);
+  auto it = rooms_.find(normalized);
+  if (it == rooms_.end()) return;
+  if (seatIndex < 0 || seatIndex >= 4) return;
+  auto& seat = it->second.seats[static_cast<std::size_t>(seatIndex)];
+  if (count < 0) count = 0;
+  const bool wasConnected = seat.connected;
+  seat.liveConnectionCount = count;
+  seat.connected = count > 0;
+  // When all owners disconnect we DO NOT clear pendingActionSince: leaving the
+  // deadline ticking lets the idle worker auto-pass for them shortly. When
+  // they reconnect we DO refresh activity so the idle deadline resets and
+  // they get a fresh thinking window.
+  if (seat.connected && !wasConnected) {
+    seat.lastSeatActivityAt = std::chrono::steady_clock::now();
+  }
+  it->second.lastActivityAt = std::chrono::steady_clock::now();
+}
+
+void RoomManager::noteSeatActivity(const std::string& roomCode, int seatIndex) {
+  const auto normalized = normalizeRoomCode(roomCode);
+  auto it = rooms_.find(normalized);
+  if (it == rooms_.end()) return;
+  if (seatIndex < 0 || seatIndex >= 4) return;
+  auto& seat = it->second.seats[static_cast<std::size_t>(seatIndex)];
+  seat.lastSeatActivityAt = std::chrono::steady_clock::now();
+  it->second.lastActivityAt = seat.lastSeatActivityAt;
+}
+
+bool RoomManager::isSeatActivelyHeld(const std::string& roomCode, int seatIndex,
+                                     std::chrono::steady_clock::time_point now,
+                                     std::chrono::milliseconds graceMs) const {
+  const auto normalized = normalizeRoomCode(roomCode);
+  const auto it = rooms_.find(normalized);
+  if (it == rooms_.end()) return false;
+  if (seatIndex < 0 || seatIndex >= 4) return false;
+  const auto& seat = it->second.seats[static_cast<std::size_t>(seatIndex)];
+  if (seat.controller != Controller::Human) return false;
+  if (seat.liveConnectionCount <= 0) return false;
+  if (seat.lastSeatActivityAt.time_since_epoch().count() == 0) return false;
+  return now - seat.lastSeatActivityAt < graceMs;
+}
+
+// ===================== Idle-seat resilience =====================
+
+namespace {
+
+// Picks a "safe" recovery action for a human seat that has gone silent past
+// the idleActMs deadline. Order:
+//   1. Pass (during a claim window): the most conservative choice -- it
+//      simply declines any call option (chow/pong/kong/win) so the human
+//      doesn't make a binding strategic decision while they're away.
+//   2. If pass is not legal (e.g., it's the seat's own turn and they must
+//      draw or discard), fall back to selectAiAction so the round can still
+//      advance. This is rarer because most soft-locks come from pass-only
+//      claim windows.
+LegalAction pickIdleAction(const RoundState& state, int seatIndex,
+                           const std::vector<LegalAction>& legalActions,
+                           const std::string& aiSeed) {
+  for (const auto& action : legalActions) {
+    if (action.type == ActionType::Pass) return action;
+  }
+  return selectAiAction(state, seatIndex, legalActions, AiDifficulty::Medium, aiSeed);
+}
+
+}  // namespace
+
+RoomManager::IdleTickOutcome RoomManager::tickIdleHumans(
+    const std::string& roomCode,
+    std::chrono::milliseconds idleActMs,
+    std::chrono::milliseconds idleTakeoverMs) {
+  IdleTickOutcome outcome;
+  const auto normalized = normalizeRoomCode(roomCode);
+  auto it = rooms_.find(normalized);
+  if (it == rooms_.end()) return outcome;
+  auto& room = it->second;
+  if (room.roundState.phase == Phase::Finished) {
+    // Clear pending markers so a fresh round starts with a clean grace.
+    for (auto& seat : room.seats) {
+      seat.pendingActionSince = std::chrono::steady_clock::time_point{};
+      seat.pendingActionVersion = -1;
+    }
+    return outcome;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  bool roomChanged = false;
+
+  // We may submit on behalf of a seat which itself mutates the room. Re-scan
+  // each iteration in case the version moved.
+  bool progressed = true;
+  int guard = 0;
+  while (progressed && guard++ < 16) {
+    progressed = false;
+    for (auto& seat : room.seats) {
+      if (seat.controller != Controller::Human) continue;
+
+      // Full takeover threshold (checked FIRST, independent of any pending
+      // action markers). If the seat has been disconnected (no live WS) for
+      // longer than `idleTakeoverMs`, convert it to AI so the room can keep
+      // playing for the rest of the round/session without that player. The
+      // displaced human can later reclaim via the regular HTTP claim flow
+      // which forces controller back to Human and issues a fresh session
+      // token. A connected-but-lurking human is handled by repeated
+      // auto-pass below; that's fine -- the round keeps progressing and we
+      // don't need to seize their seat.
+      const auto disconnectedFor = now - seat.lastSeatActivityAt;
+      const bool disconnectedTooLong =
+          seat.liveConnectionCount <= 0 &&
+          seat.lastSeatActivityAt.time_since_epoch().count() > 0 &&
+          disconnectedFor >= idleTakeoverMs;
+      if (disconnectedTooLong) {
+        seat.controller = Controller::Ai;
+        seat.sessionTokenHash.reset();
+        seat.liveConnectionCount = 0;
+        seat.connected = false;
+        seat.pendingActionSince = std::chrono::steady_clock::time_point{};
+        seat.pendingActionVersion = -1;
+        outcome.seatsConvertedToAi.push_back(seat.seatIndex);
+        room.version += 1;
+        room.lastActivityAt = now;
+        if (room.aiDelayMs <= 0) scheduleAiForRoomSync(room);
+        else refreshAiPending(room);
+        roomChanged = true;
+        progressed = true;
+        break;
+      }
+
+      auto actions = roomLegalActions(room, seat.seatIndex);
+      if (actions.empty()) {
+        // Not blocking anything -- reset the pending markers so the next time
+        // a claim window opens they get a fresh deadline.
+        seat.pendingActionSince = std::chrono::steady_clock::time_point{};
+        seat.pendingActionVersion = -1;
+        continue;
+      }
+      // First time we see legal actions for this seat at this version: start
+      // the deadline now.
+      if (seat.pendingActionVersion != room.version) {
+        seat.pendingActionVersion = room.version;
+        seat.pendingActionSince = now;
+        continue;
+      }
+      const auto elapsed = now - seat.pendingActionSince;
+
+      // Auto-act threshold: prefer Pass to avoid making any binding decision
+      // on the absent player's behalf. Falls back to AI choice if no pass is
+      // legal (it's the seat's own turn and the round still needs an action).
+      if (elapsed >= idleActMs) {
+        const auto action = pickIdleAction(
+            room.roundState, seat.seatIndex, actions,
+            room.roomCode + ":idle:" + std::to_string(room.version));
+        const auto result = submitSeatAction(
+            room.roomCode, seat.seatIndex, std::nullopt, room.version,
+            action, Controller::Human);
+        if (result.ok && result.room) {
+          room = *result.room;
+          roomChanged = true;
+          progressed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  outcome.changed = roomChanged;
+  return outcome;
+}
+
+std::optional<std::chrono::steady_clock::time_point> RoomManager::nextIdleDueAt(
+    const std::string& roomCode,
+    std::chrono::milliseconds idleActMs,
+    std::chrono::milliseconds idleTakeoverMs) const {
+  const auto normalized = normalizeRoomCode(roomCode);
+  const auto it = rooms_.find(normalized);
+  if (it == rooms_.end()) return std::nullopt;
+  const auto& room = it->second;
+  if (room.roundState.phase == Phase::Finished) return std::nullopt;
+  std::optional<std::chrono::steady_clock::time_point> earliest;
+  for (const auto& seat : room.seats) {
+    if (seat.controller != Controller::Human) continue;
+    if (seat.pendingActionVersion != room.version) continue;
+    if (seat.pendingActionSince.time_since_epoch().count() == 0) continue;
+    const auto due = seat.pendingActionSince + std::min(idleActMs, idleTakeoverMs);
+    if (!earliest || due < *earliest) earliest = due;
+  }
+  return earliest;
+}
+
+}  // namespace mahjong::server
